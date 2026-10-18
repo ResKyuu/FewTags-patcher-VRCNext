@@ -30,7 +30,7 @@ Your existing files that need replacing are backed up in the VRCNext folder. Lau
 
 - **FewTags data:** the patcher downloads and validates the newest FewTags databases each time you apply the integration.
 - **Patcher:** when a newer patcher release is available, the app asks before downloading it. It checks the release's SHA-256 checksum before replacing itself.
-- **VRCNext integration:** this repository checks for a VRCNext release every four hours. A compatible build is published automatically after the integration patch and build succeed. The patcher prompts before installing its own update; it will not replace a newer VRCNext install with an older build.
+- **VRCNext integration and patcher:** this repository checks for a VRCNext release every four hours and also rebuilds when the patcher or integration source changes. A compatible release is published after the integration patch and build succeed. The patcher prompts before installing its own update; it will not replace a newer VRCNext install with an older build.
 
 If VRCNext changes in a way that breaks the integration, the build stops and no new patcher release is published until the integration is fixed.
 
@@ -49,7 +49,7 @@ The build job has read-only repository permission. A separate job receives relea
 
 ## For contributors
 
-The integration patch is in [`integration/`](integration/), and the Windows Forms patcher is in [`patcher/`](patcher/). To create a release manually, run **Build and publish latest VRCNext FewTags patcher** from the repository's Actions page using **Run workflow**.
+The integration patch is in [`integration/`](integration/), and the Windows Forms patcher is in [`patcher/`](patcher/). To create a release manually, run **Build and publish latest VRCNext FewTags patcher** from the repository's Actions page using **Run workflow**. Select **Rebuild and release the patcher for the current VRCNext version** when you need a fresh release without a newer VRCNext tag.
 
 ## Upstream projects
 

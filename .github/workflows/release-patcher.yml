@@ -10,6 +10,12 @@ on:
   schedule:
     - cron: "17 */4 * * *"
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild and release the patcher for the current VRCNext version
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: latest-vrcnext-patcher
@@ -24,12 +30,15 @@ jobs:
     outputs:
       build: ${{ steps.check.outputs.build }}
       upstream_tag: ${{ steps.check.outputs.tag }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
       release_tag: ${{ steps.apply-integration.outputs.release_tag }}
       version: ${{ steps.apply-integration.outputs.version }}
     steps:
       - name: Check whether VRCNext has a newer release
         id: check
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
         with:
           script: |
             const upstream = await github.rest.repos.getLatestRelease({ owner: 'shinyflvre', repo: 'VRCNext' });
@@ -38,16 +47,22 @@ jobs:
               throw new Error(`Unexpected VRCNext release tag format: ${tag}`);
             }
             core.setOutput('tag', tag);
+            core.setOutput('source_sha', context.sha);
             let previous = null;
+            let previousSource = null;
             try {
               const release = await github.rest.repos.getLatestRelease({ owner: context.repo.owner, repo: context.repo.repo });
               const marker = /^VRCNext release:\s*(.+)$/mi.exec(release.data.body || '');
               previous = marker?.[1]?.trim() || null;
+              const sourceMarker = /^Patcher source commit:\s*([0-9a-f]{40})$/mi.exec(release.data.body || '');
+              previousSource = sourceMarker?.[1]?.toLowerCase() || null;
             } catch (error) {
               if (error.status !== 404) throw error;
             }
-            core.setOutput('build', previous === tag ? 'false' : 'true');
-            core.info(`Upstream ${tag}; last integrated ${previous || '(none)'}`);
+            const forceRebuild = process.env.FORCE_REBUILD === 'true';
+            const shouldBuild = previous !== tag || previousSource !== context.sha || forceRebuild;
+            core.setOutput('build', shouldBuild ? 'true' : 'false');
+            core.info(`Upstream ${tag}; last integrated ${previous || '(none)'}; source ${context.sha}; last source ${previousSource || '(not recorded)'}; force=${forceRebuild}`);
 
       - name: Check out patcher source
         if: steps.check.outputs.build == 'true'
@@ -162,13 +177,15 @@ jobs:
           RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
           RELEASE_TITLE: VRCNext ${{ needs.build.outputs.version }} with FewTags
           UPSTREAM_TAG: ${{ needs.build.outputs.upstream_tag }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
         run: |
           notes_file="${RUNNER_TEMP}/release-notes.md"
-          printf 'VRCNext release: %s\n\nThis release contains the latest compatible VRCNext build with the FewTags profile integration. The patcher downloads the latest FewTags databases when it runs.\n' "$UPSTREAM_TAG" > "$notes_file"
+          printf 'VRCNext release: %s\nPatcher source commit: %s\n\nThis release contains the latest compatible VRCNext build with the FewTags profile integration. The patcher downloads the latest FewTags databases when it runs.\n' "$UPSTREAM_TAG" "$SOURCE_SHA" > "$notes_file"
           gh release create "$RELEASE_TAG" \
             release/VRCNext-FewTags-Patcher.exe \
             release/VRCNext-FewTags-Patcher.exe.sha256 \
             --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
             --title "$RELEASE_TITLE" \
             --notes-file "$notes_file" \
             --latest
