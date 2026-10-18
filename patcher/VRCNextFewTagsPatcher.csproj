@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>VRCNext-FewTags-Patcher</AssemblyName>
+    <VRCNextVersion Condition="'$(VRCNextVersion)' == ''">2026.62.3</VRCNextVersion>
+    <PatcherVersion Condition="'$(PatcherVersion)' == ''">v2026.62.3-ft-local</PatcherVersion>
+    <VRCNextPayloadArchive Condition="'$(VRCNextPayloadArchive)' == ''">..\..\outputs\VRCNext-FewTags-Windows.zip</VRCNextPayloadArchive>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="$(VRCNextPayloadArchive)" LogicalName="VRCNext-FewTags-Windows.zip" />
+  </ItemGroup>
+  <Target Name="GeneratePatcherBuildInfo" BeforeTargets="CoreCompile">
+    <WriteLinesToFile File="$(IntermediateOutputPath)PatcherBuildInfo.g.cs"
+      Lines="namespace VRCNextFewTagsPatcher%3B internal static class PatcherBuildInfo { internal const string VrcNextVersion = %22$(VRCNextVersion)%22%3B internal const string PatcherVersion = %22$(PatcherVersion)%22%3B }"
+      Overwrite="true" />
+    <ItemGroup>
+      <Compile Include="$(IntermediateOutputPath)PatcherBuildInfo.g.cs" />
+    </ItemGroup>
+  </Target>
+</Project>

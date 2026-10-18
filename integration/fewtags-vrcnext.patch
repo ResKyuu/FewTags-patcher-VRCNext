@@ -1,0 +1,745 @@
+diff --git a/Services/Assets/FewTags/FewTags-README.md b/Services/Assets/FewTags/FewTags-README.md
+new file mode 100644
+index 0000000..8039c1e
+--- /dev/null
++++ b/Services/Assets/FewTags/FewTags-README.md
+@@ -0,0 +1,10 @@
++Just Databases Of UserID's With Tags/Notes In Which I Maintain Which Might Not Be 100% Accurate or Possibly Even Opinion Based.
++
++If You Want A Tag Removed/Changed or Added DM *@FewTags* On Discord or In The Case You Already Have Me Added Or Share A Mutual Server DM *@Fewdy* - Sensitive Information & Slurs Is NOT Allowed.
++
++Animated Tags Are $4.00 Per Animated Tag
++
++Any Devs Looking To Use This DB Should Take A Look At Source Found Below
++
++#### *VRChat Source Has Been Moved To It's Own Repository & Archieved As I Have Not Maintained It Since EAC Was Added & No Longer Intend On Updating It*
++[VRChat Source](https://github.com/Fewdys/FewTags-VRC-Source)
+diff --git a/Services/FewTagsService.cs b/Services/FewTagsService.cs
+new file mode 100644
+index 0000000..e19f722
+--- /dev/null
++++ b/Services/FewTagsService.cs
+@@ -0,0 +1,260 @@
++using System.Net;
++using System.Net.Http.Headers;
++using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++
++namespace VRCNext.Services;
++
++/// <summary>
++/// Reads the bundled FewTags databases and refreshes cached copies from the upstream repository.
++/// </summary>
++internal static class FewTagsService
++{
++    private sealed record Entry(IReadOnlyList<string> Labels, bool MarkedMalicious);
++
++    private const string FeedBase = "https://raw.githubusercontent.com/Fewdys/FewTags/main/";
++    private const int MaxDatabaseBytes = 32 * 1024 * 1024;
++    private static readonly string[] DatabaseFiles = ["FewTagsv2.json", "FewTags.json"];
++    private static readonly string CacheDirectory = Path.Combine(
++        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VRCNext", "FewTags");
++    private static readonly string StatePath = Path.Combine(CacheDirectory, "refresh-state.json");
++    private static readonly HttpClient Http = CreateHttpClient();
++    private static readonly SemaphoreSlim RefreshGate = new(1, 1);
++    private static IReadOnlyDictionary<string, Entry> _entries = Load();
++    private static int _autoRefreshStarted;
++
++    public static object? GetTags(string userId)
++    {
++        var entries = Volatile.Read(ref _entries);
++        if (string.IsNullOrWhiteSpace(userId) || !entries.TryGetValue(userId, out var entry))
++            return null;
++
++        return new { labels = entry.Labels, markedMalicious = entry.MarkedMalicious };
++    }
++
++    /// <summary>Starts a background refresh immediately, then checks upstream every six hours.</summary>
++    public static void StartAutoRefresh()
++    {
++        if (Interlocked.Exchange(ref _autoRefreshStarted, 1) != 0) return;
++        _ = Task.Run(async () =>
++        {
++            while (true)
++            {
++                try { await RefreshAsync().ConfigureAwait(false); }
++                catch (Exception ex) { CrashHandler.WriteEntry("FewTags.Refresh", ex); }
++                await Task.Delay(TimeSpan.FromHours(6)).ConfigureAwait(false);
++            }
++        });
++    }
++
++    private static async Task RefreshAsync()
++    {
++        await RefreshGate.WaitAsync().ConfigureAwait(false);
++        try
++        {
++            Directory.CreateDirectory(CacheDirectory);
++            var etags = ReadEtags();
++            var changed = false;
++
++            foreach (var fileName in DatabaseFiles)
++            {
++                try
++                {
++                    changed |= await RefreshFileAsync(fileName, etags).ConfigureAwait(false);
++                }
++                catch (Exception ex)
++                {
++                    // Keep the last known good cache (or bundled copy) when the network is unavailable.
++                    CrashHandler.WriteEntry($"FewTags.Refresh.{fileName}", ex);
++                }
++            }
++
++            SaveEtags(etags);
++            if (changed) Interlocked.Exchange(ref _entries, Load());
++        }
++        finally
++        {
++            RefreshGate.Release();
++        }
++    }
++
++    private static async Task<bool> RefreshFileAsync(string fileName, Dictionary<string, string> etags)
++    {
++        var cachePath = Path.Combine(CacheDirectory, fileName);
++        using var request = new HttpRequestMessage(HttpMethod.Get, FeedBase + fileName);
++        request.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
++        if (File.Exists(cachePath) && etags.TryGetValue(fileName, out var etag) &&
++            EntityTagHeaderValue.TryParse(etag, out var parsedEtag))
++            request.Headers.IfNoneMatch.Add(parsedEtag);
++
++        using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
++        if (response.StatusCode == HttpStatusCode.NotModified) return false;
++        response.EnsureSuccessStatusCode();
++
++        var bytes = await ReadLimitedAsync(response.Content).ConfigureAwait(false);
++        if (!IsValidDatabase(bytes))
++            throw new InvalidDataException($"The upstream {fileName} response was not a valid FewTags database.");
++
++        var temporaryPath = cachePath + ".download-" + Guid.NewGuid().ToString("N");
++        try
++        {
++            await File.WriteAllBytesAsync(temporaryPath, bytes).ConfigureAwait(false);
++            File.Move(temporaryPath, cachePath, overwrite: true);
++        }
++        finally
++        {
++            try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); } catch { }
++        }
++
++        if (response.Headers.ETag is { } newEtag)
++            etags[fileName] = newEtag.ToString();
++        else
++            etags.Remove(fileName);
++        return true;
++    }
++
++    private static async Task<byte[]> ReadLimitedAsync(HttpContent content)
++    {
++        if (content.Headers.ContentLength is > MaxDatabaseBytes)
++            throw new InvalidDataException("The FewTags database exceeded the download size limit.");
++
++        await using var input = await content.ReadAsStreamAsync().ConfigureAwait(false);
++        using var output = new MemoryStream();
++        var buffer = new byte[64 * 1024];
++        while (true)
++        {
++            var read = await input.ReadAsync(buffer).ConfigureAwait(false);
++            if (read == 0) break;
++            if (output.Length + read > MaxDatabaseBytes)
++                throw new InvalidDataException("The FewTags database exceeded the download size limit.");
++            output.Write(buffer, 0, read);
++        }
++        return output.ToArray();
++    }
++
++    private static bool IsValidDatabase(byte[] bytes)
++    {
++        try
++        {
++            var root = JObject.Parse(System.Text.Encoding.UTF8.GetString(bytes));
++            if (root["records"] is not JArray records || records.Count == 0) return false;
++            return records.OfType<JObject>().Any(record =>
++                !string.IsNullOrWhiteSpace(record["UserID"]?.ToString()));
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    private static Dictionary<string, string> ReadEtags()
++    {
++        try
++        {
++            if (File.Exists(StatePath))
++                return JsonConvert.DeserializeObject<Dictionary<string, string>>(File.ReadAllText(StatePath))
++                    ?? new Dictionary<string, string>(StringComparer.Ordinal);
++        }
++        catch { }
++        return new Dictionary<string, string>(StringComparer.Ordinal);
++    }
++
++    private static void SaveEtags(Dictionary<string, string> etags)
++    {
++        try
++        {
++            var temporaryPath = StatePath + ".tmp";
++            File.WriteAllText(temporaryPath, JsonConvert.SerializeObject(etags));
++            File.Move(temporaryPath, StatePath, overwrite: true);
++        }
++        catch { }
++    }
++
++    private static HttpClient CreateHttpClient()
++    {
++        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
++        client.DefaultRequestHeaders.UserAgent.ParseAdd("VRCNext-FewTags/1.0");
++        return client;
++    }
++
++    private static IReadOnlyDictionary<string, Entry> Load()
++    {
++        var result = new Dictionary<string, Entry>(StringComparer.Ordinal);
++        var v2UserIds = new HashSet<string>(StringComparer.Ordinal);
++
++        // FewTagsv2 is the newer schema. Even an inactive v2 entry takes precedence over a
++        // legacy entry, so a removed tag is not accidentally restored from the older database.
++        foreach (var record in ReadRecords("FewTagsv2.json"))
++        {
++            var userId = record["UserID"]?.ToString();
++            if (string.IsNullOrWhiteSpace(userId)) continue;
++            v2UserIds.Add(userId);
++            if (record["Active"]?.Value<bool>() != true) continue;
++
++            var labels = new List<string>();
++            AddIfActive(labels, record, "PlateText", "TextActive");
++            AddIfActive(labels, record, "PlateText2", "Text2Active");
++            AddIfActive(labels, record, "PlateText3", "Text3Active");
++            AddIfActive(labels, record, "PlateBigText", "BigTextActive");
++            var markedMalicious = record["Malicious"]?.Value<bool>() == true;
++            if (labels.Count == 0 && !markedMalicious) continue;
++
++            result[userId] = new Entry(labels, markedMalicious);
++        }
++
++        // The legacy database contains IDs not migrated to v2 and uses Tag[] plus TextActive.
++        foreach (var record in ReadRecords("FewTags.json"))
++        {
++            var userId = record["UserID"]?.ToString();
++            if (string.IsNullOrWhiteSpace(userId) || v2UserIds.Contains(userId)) continue;
++            if (record["Active"]?.Value<bool>() != true) continue;
++
++            var labels = new List<string>();
++            if (record["TextActive"]?.Value<bool>() == true && record["Tag"] is JArray tags)
++            {
++                foreach (var tag in tags)
++                {
++                    var text = tag.ToString().Trim();
++                    if (!string.IsNullOrEmpty(text)) labels.Add(text);
++                }
++            }
++            AddIfActive(labels, record, "PlateBigText", "BigTextActive");
++
++            var markedMalicious = record["Malicious"]?.Value<bool>() == true;
++            if (labels.Count == 0 && !markedMalicious) continue;
++            result[userId] = new Entry(labels, markedMalicious);
++        }
++
++        return result;
++    }
++
++    private static IEnumerable<JObject> ReadRecords(string fileName)
++    {
++        var candidates = new[]
++        {
++            Path.Combine(CacheDirectory, fileName),
++            Path.Combine(AppContext.BaseDirectory, fileName),
++        };
++        foreach (var path in candidates)
++        {
++            try
++            {
++                if (!File.Exists(path)) continue;
++                var records = JObject.Parse(File.ReadAllText(path))["records"] as JArray;
++                if (records is { Count: > 0 }) return records.OfType<JObject>().ToArray();
++            }
++            catch
++            {
++                // If the writable cache is corrupt, fall back to the bundled database.
++            }
++        }
++        return Array.Empty<JObject>();
++    }
++
++    private static void AddIfActive(List<string> labels, JObject record, string textField, string activeField)
++    {
++        if (record[activeField]?.Value<bool>() != true) return;
++        var text = record[textField]?.ToString()?.Trim();
++        if (!string.IsNullOrEmpty(text)) labels.Add(text);
++    }
++}
+diff --git a/VRCNext.csproj b/VRCNext.csproj
+index 7c06a41..e296467 100644
+--- a/VRCNext.csproj
++++ b/VRCNext.csproj
+@@ -74,6 +74,9 @@
+ 
+   <ItemGroup>
+     <Content Include="frontend\**" CopyToOutputDirectory="PreserveNewest" />
++    <Content Include="Services\Assets\FewTags\FewTagsv2.json" Link="FewTagsv2.json" CopyToOutputDirectory="PreserveNewest" />
++    <Content Include="Services\Assets\FewTags\FewTags.json" Link="FewTags.json" CopyToOutputDirectory="PreserveNewest" />
++    <Content Include="Services\Assets\FewTags\FewTags-README.md" Link="FewTags-README.md" CopyToOutputDirectory="PreserveNewest" />
+   </ItemGroup>
+ 
+   <ItemGroup>
+diff --git a/frontend/core/modals/my-profile-modal/my-profile-modal.js b/frontend/core/modals/my-profile-modal/my-profile-modal.js
+index b15a9c3..f2a65a1 100644
+--- a/frontend/core/modals/my-profile-modal/my-profile-modal.js
++++ b/frontend/core/modals/my-profile-modal/my-profile-modal.js
+@@ -600,11 +600,25 @@ function renderMyProfileContent() {
+ 
+     const _mypHasAv  = !!_mypAvatarInner;
+     const _mypHasRep = !!repGroupCardHtml;
++    const _myFewTagLabels = Array.isArray(u.fewTags?.labels) ? u.fewTags.labels : [];
++    const _myFewTagsHtml = _myFewTagLabels.map(label => {
++        const animation = String(label || '').match(/\[([A-Za-z]+)\]/)?.[1]?.toLowerCase();
++        const animationClass = animation ? ` fd-fewtag-is-${animation}` : '';
++        const animated = typeof fewTagsAnimatedHtml === 'function'
++            ? fewTagsAnimatedHtml(label) : esc(label);
++        return `<span class="fd-fewtag${animationClass}">${animated}</span>`;
++    }).join('');
++    const _myFewTagsCard = (_myFewTagLabels.length || u.fewTags?.markedMalicious) ? `<div class="fd-info-card fd-fewtags-card">
++        <div class="fd-group-rep-label">FewTags</div>
++        ${_myFewTagLabels.length ? `<div class="fd-fewtags-list">${_myFewTagsHtml}</div>` : ''}
++        ${u.fewTags?.markedMalicious ? `<div class="fd-fewtags-note">This profile is marked as malicious in the FewTags dataset.</div>` : ''}
++    </div>` : '';
+     const infoContent = `<div class="fd-info-wrap">
+             <div id="mypInfoCols" class="fd-info-cols fd-info-cols-even${_mypHasAv !== _mypHasRep ? ' fd-info-cols-single' : ''}">
+                 <div class="fd-info-left"${_mypHasAv ? '' : ' style="display:none;"'}>${_mypAvatarCard}</div>
+                 <div class="fd-info-right"${_mypHasRep ? '' : ' style="display:none;"'}>${repGroupCardHtml}</div>
+             </div>
++            ${_myFewTagsCard}
+             ${_bioCard}
+             ${_mypTlCard}
+             ${_mypInsightsCard}
+@@ -856,6 +870,8 @@ function handleMyProfileFields(p) {
+     currentVrcUser.bio       = p.bio || '';
+     currentVrcUser.bioLinks  = p.bioLinks || [];
+     currentVrcUser.languages = p.languages || [];
++    currentVrcUser.fewTags   = p.fewTags || null;
++    if (typeof renderMyProfileContent === 'function') renderMyProfileContent();
+ }
+ 
+ function _renderMyLangsEdit() {
+diff --git a/frontend/core/modals/user-modal/user-modal.css b/frontend/core/modals/user-modal/user-modal.css
+index 55fe383..a954e67 100644
+--- a/frontend/core/modals/user-modal/user-modal.css
++++ b/frontend/core/modals/user-modal/user-modal.css
+@@ -95,6 +95,224 @@
+     border-bottom: 1px solid var(--brd);
+ }
+ 
++.fd-fewtags-card {
++    background: linear-gradient(145deg,
++        color-mix(in srgb, var(--accent) 8%, var(--bg-input)),
++        var(--bg-input) 62%);
++    border-color: color-mix(in srgb, var(--accent) 25%, var(--brd));
++    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 10%, transparent);
++}
++
++.fd-fewtags-card .fd-group-rep-label {
++    display: flex;
++    align-items: center;
++    gap: 8px;
++    font-weight: 650;
++    letter-spacing: .02em;
++}
++
++.fd-fewtags-card .fd-group-rep-label::before {
++    content: "";
++    width: 3px;
++    height: 15px;
++    flex: 0 0 3px;
++    border-radius: 999px;
++    background: var(--accent);
++    box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 45%, transparent);
++}
++
++.fd-fewtags-list {
++    display: flex;
++    flex-wrap: wrap;
++    gap: 7px;
++}
++
++.fd-fewtag {
++    max-width: 100%;
++    padding: 5px 10px;
++    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--brd));
++    border-radius: 10px;
++    background: linear-gradient(145deg,
++        color-mix(in srgb, var(--accent) 7%, var(--bg-card)),
++        var(--bg-card) 72%);
++    color: var(--tx1);
++    font-size: calc(12px + var(--fs-off, 0px));
++    line-height: 1.5;
++    overflow-wrap: anywhere;
++    box-shadow: inset 0 1px 0 color-mix(in srgb, white 4%, transparent);
++    transition: border-color .16s ease, transform .16s ease, box-shadow .16s ease;
++}
++
++.fd-fewtag:hover {
++    border-color: color-mix(in srgb, var(--accent) 48%, var(--brd));
++    transform: translateY(-1px);
++    box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 10%, transparent);
++}
++
++.fd-fewtag-animated { display: inline-block; position: relative; }
++.fd-fewtag-letter { display: inline-block; white-space: pre; }
++
++.fd-fewtag-is-scroll {
++    display: inline-block;
++    width: max-content;
++    max-width: 100%;
++    overflow: hidden;
++    white-space: nowrap;
++    vertical-align: bottom;
++}
++
++.fd-fewtag-is-scroll .fd-fewtag-animated {
++    display: block;
++    width: max-content;
++    max-width: none;
++    animation: fd-fewtag-scroll 8s linear infinite;
++}
++
++.fd-fewtag-scroll-track { display: flex; width: max-content; }
++.fd-fewtag-scroll-track > span { flex: 0 0 auto; padding-right: 2em; }
++
++@keyframes fd-fewtag-scroll {
++    from { transform: translateX(0); }
++    to { transform: translateX(-50%); }
++}
++
++.fd-fewtag-is-cyln { position: relative; overflow: hidden; }
++.fd-fewtag-is-cyln .fd-fewtag-animated { z-index: 0; }
++.fd-fewtag-is-cyln::after {
++    content: "";
++    position: absolute;
++    z-index: 1;
++    top: 2px;
++    bottom: 2px;
++    left: 0;
++    width: 2px;
++    border-radius: 2px;
++    background: #ff334f;
++    box-shadow: 0 0 7px 2px rgb(255 51 79 / 62%);
++    pointer-events: none;
++    animation: fd-fewtag-cyln 1.8s ease-in-out infinite alternate;
++}
++
++@keyframes fd-fewtag-cyln {
++    from { left: 2px; }
++    to { left: calc(100% - 4px); }
++}
++
++.fd-fewtag-anim-lbl .fd-fewtag-letter {
++    opacity: 0;
++    animation: fd-fewtag-letter-by-letter 2.8s steps(1, end) infinite;
++    animation-delay: var(--fd-letter-delay);
++}
++
++@keyframes fd-fewtag-letter-by-letter {
++    0%, 8% { opacity: 0; transform: translateY(.12em); }
++    18%, 76% { opacity: 1; transform: translateY(0); }
++    86%, 100% { opacity: 0; transform: translateY(-.08em); }
++}
++
++.fd-fewtag-anim-rain .fd-fewtag-letter {
++    color: #ff4058;
++    animation: fd-fewtag-rainbow 1.25s steps(7, end) infinite;
++    animation-delay: var(--fd-letter-delay);
++}
++
++.fd-fewtag-anim-sr .fd-fewtag-letter {
++    color: #ff4058;
++    animation: fd-fewtag-rainbow 3.2s linear infinite;
++    animation-delay: var(--fd-letter-delay);
++}
++
++@keyframes fd-fewtag-rainbow {
++    from { filter: hue-rotate(0deg); }
++    to { filter: hue-rotate(360deg); }
++}
++
++.fd-fewtag-anim-pulse .fd-fewtag-letter {
++    animation: fd-fewtag-pulse .82s ease-in-out infinite;
++    animation-delay: var(--fd-letter-delay);
++}
++
++@keyframes fd-fewtag-pulse {
++    0%, 100% { transform: scale(1); }
++    50% { transform: scale(1.24); }
++}
++
++.fd-fewtag-anim-jump .fd-fewtag-letter {
++    animation: fd-fewtag-jump .72s ease-in-out infinite;
++    animation-delay: var(--fd-letter-delay);
++}
++
++@keyframes fd-fewtag-jump {
++    0%, 100% { transform: translateY(0); }
++    40% { transform: translateY(-.28em); }
++}
++
++.fd-fewtag-anim-shake .fd-fewtag-letter {
++    animation: fd-fewtag-shake .34s ease-in-out infinite;
++    animation-delay: var(--fd-letter-delay);
++}
++
++@keyframes fd-fewtag-shake {
++    0%, 100% { transform: translateX(0); }
++    25% { transform: translateX(-1px) rotate(-2deg); }
++    75% { transform: translateX(1px) rotate(2deg); }
++}
++
++.fd-fewtag-anim-gt .fd-fewtag-letter {
++    color: #777;
++    text-shadow: 0 0 5px rgb(0 0 0 / 80%);
++    animation: fd-fewtag-ghost 1.7s ease-in-out infinite;
++    animation-delay: var(--fd-letter-delay);
++}
++
++@keyframes fd-fewtag-ghost {
++    0%, 100% { opacity: .38; }
++    45%, 70% { opacity: 1; }
++}
++
++.fd-fewtag-anim-blink .fd-fewtag-animated {
++    animation: fd-fewtag-blink 1.1s steps(2, end) infinite;
++}
++
++@keyframes fd-fewtag-blink {
++    0%, 48%, 100% { opacity: 1; }
++    49%, 72% { opacity: .08; }
++}
++
++.fd-fewtag-anim-glitch .fd-fewtag-animated {
++    animation: fd-fewtag-glitch .9s steps(1, end) infinite;
++}
++
++.fd-fewtag-anim-glitch .fd-fewtag-letter:nth-child(3n) { color: #ff526c; }
++.fd-fewtag-anim-glitch .fd-fewtag-letter:nth-child(4n) { text-shadow: 1px 0 #35d9ff, -1px 0 #ff365c; }
++
++@keyframes fd-fewtag-glitch {
++    0%, 82%, 100% { transform: none; filter: none; }
++    84% { transform: translateX(1px) skewX(-3deg); filter: saturate(1.8); }
++    86% { transform: translateX(-2px) skewX(4deg); }
++    88% { transform: translateX(1px); filter: none; }
++}
++
++@media (prefers-reduced-motion: reduce) {
++    .fd-fewtag-animated,
++    .fd-fewtag-letter,
++    .fd-fewtag-is-cyln::after {
++        animation: none !important;
++        transform: none !important;
++        filter: none !important;
++    }
++    .fd-fewtag-anim-lbl .fd-fewtag-letter { opacity: 1; }
++    .fd-fewtag-anim-rain .fd-fewtag-letter,
++    .fd-fewtag-anim-sr .fd-fewtag-letter,
++    .fd-fewtag-anim-gt .fd-fewtag-letter { color: inherit; }
++}
++
++.fd-fewtags-note {
++    margin-top: 8px;
++    color: var(--tx3);
++    font-size: calc(10px + var(--fs-off, 0px));
++}
++
+ .fd-info-card .myp-section-header {
+     padding-bottom: 8px;
+     margin-bottom: 10px;
+diff --git a/frontend/core/modals/user-modal/user-modal.js b/frontend/core/modals/user-modal/user-modal.js
+index 6382c34..ea3759d 100644
+--- a/frontend/core/modals/user-modal/user-modal.js
++++ b/frontend/core/modals/user-modal/user-modal.js
+@@ -663,6 +663,87 @@ function renderDiscordChip(discordId) {
+     return `<button class="fd-bio-link" onclick="sendToCS({action:'openUrl',url:'${jsq('https://discord.com/users/' + discordId)}'})" title="${esc(discordId)}">${svg}<span>${esc(label)}</span></button>`;
+ }
+ 
++// FewTags entries use Unity rich text. Only translate a small, safe subset to HTML;
++// escape all text and leave unsupported markup visible as text.
++function fewTagsRichTextHtml(value) {
++    const source = String(value || '');
++    const tokenRe = /<color=#[0-9a-f]{3,8}>|<\/color>|<b>|<\/b>|<i>|<\/i>|<size=\d+>|<\/size>|<br\s*\/?\s*>/gi;
++    const stack = [];
++    let html = '';
++    let last = 0;
++    let match;
++    while ((match = tokenRe.exec(source)) !== null) {
++        html += esc(source.slice(last, match.index));
++        const token = match[0];
++        const lower = token.toLowerCase();
++        if (lower.startsWith('<color=')) {
++            const color = lower.match(/^<color=(#[0-9a-f]{3,8})>$/)?.[1];
++            if (color) { html += `<span style="color:${color}">`; stack.push(['color', '</span>']); }
++        } else if (lower === '<b>') {
++            html += '<strong>'; stack.push(['b', '</strong>']);
++        } else if (lower === '<i>') {
++            html += '<em>'; stack.push(['i', '</em>']);
++        } else if (lower.startsWith('<size=')) {
++            const size = Number(lower.match(/^<size=(\d+)>$/)?.[1]);
++            if (Number.isFinite(size)) {
++                const px = Math.max(8, Math.min(size, 24));
++                html += `<span style="font-size:${px}px">`; stack.push(['size', '</span>']);
++            }
++        } else if (lower === '<br>' || lower === '<br/>' || lower === '<br />') {
++            html += '<br>';
++        } else {
++            const closeType = lower === '</color>' ? 'color' : lower === '</b>' ? 'b' : lower === '</i>' ? 'i' : 'size';
++            if (stack.length && stack[stack.length - 1][0] === closeType) html += stack.pop()[1];
++        }
++        last = tokenRe.lastIndex;
++    }
++    html += esc(source.slice(last));
++    while (stack.length) html += stack.pop()[1];
++    return html;
++}
++
++const FEWTAGS_ANIMATED_PREFIX = /^\.(LBL|CYLN|RAIN|SR|PULSE|JUMP|SHAKE|GT|BLINK|GLITCH|SCROLL)\./i;
++
++function fewTagsLettersHtml(html) {
++    const template = document.createElement('template');
++    template.innerHTML = html;
++    const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
++    const textNodes = [];
++    while (walker.nextNode()) textNodes.push(walker.currentNode);
++
++    let index = 0;
++    for (const node of textNodes) {
++        if (!node.nodeValue) continue;
++        const fragment = document.createDocumentFragment();
++        for (const character of Array.from(node.nodeValue)) {
++            const letter = document.createElement('span');
++            letter.className = 'fd-fewtag-letter';
++            letter.style.setProperty('--fd-letter-delay', `${index * -0.055}s`);
++            letter.textContent = character;
++            fragment.appendChild(letter);
++            index++;
++        }
++        node.parentNode.replaceChild(fragment, node);
++    }
++    return template.innerHTML;
++}
++
++function fewTagsAnimatedHtml(value) {
++    const source = String(value || '');
++    const prefix = source.match(FEWTAGS_ANIMATED_PREFIX);
++    if (!prefix) return fewTagsRichTextHtml(source);
++
++    const animation = prefix[1].toLowerCase();
++    let content = fewTagsRichTextHtml(source.slice(prefix[0].length));
++    if (['lbl', 'rain', 'sr', 'pulse', 'jump', 'shake', 'gt'].includes(animation)) {
++        content = fewTagsLettersHtml(content);
++    }
++    if (animation === 'scroll') {
++        content = `<span class="fd-fewtag-scroll-track"><span>${content}</span><span aria-hidden="true">${content}</span></span>`;
++    }
++    return `<span class="fd-fewtag-animated fd-fewtag-anim-${animation}">${content}</span>`;
++}
++
+ function renderFriendDetail(d) {
+     const _fdPrevTab = document.querySelector('#modalFriendDetail .fd-tab.active')?.dataset.fdtab || '';
+     const _fdPrevId  = (typeof currentFriendDetail !== 'undefined' && currentFriendDetail) ? currentFriendDetail.id : '';
+@@ -1051,6 +1132,17 @@ function renderFriendDetail(d) {
+     // Biography card; the id-badge truncates with ellipsis to keep them on one row.
+     const _bioBadgesHtml = badgesHtml.replace('<div class="fd-badges-row">', '<div class="fd-badges-row fd-bio-badges-row" style="margin-bottom:10px;">');
+     const _bioCardCondition = (d.id || d.bio || bioLinksHtml);
++    const _fewTagLabels = Array.isArray(d.fewTags?.labels) ? d.fewTags.labels : [];
++    const _fewTagLabelsHtml = _fewTagLabels.map(label => {
++        const animation = String(label || '').match(FEWTAGS_ANIMATED_PREFIX)?.[1]?.toLowerCase();
++        const animationClass = animation ? ` fd-fewtag-is-${animation}` : '';
++        return `<span class="fd-fewtag${animationClass}">${fewTagsAnimatedHtml(label)}</span>`;
++    }).join('');
++    const _fewTagsCard = (_fewTagLabels.length || d.fewTags?.markedMalicious) ? `<div class="fd-info-card fd-fewtags-card">
++        <div class="fd-group-rep-label">FewTags</div>
++        ${_fewTagLabels.length ? `<div class="fd-fewtags-list">${_fewTagLabelsHtml}</div>` : ''}
++        ${d.fewTags?.markedMalicious ? `<div class="fd-fewtags-note">This profile is marked as malicious in the FewTags dataset.</div>` : ''}
++    </div>` : '';
+     const _bioTransBtn = (d.bio && window._kxdProfileTranslationEnabled !== false)
+         ? `<button class="fd-bio-translate myp-edit-btn" onclick="fdTranslateBio(this)" title="${esc(t('profiles.bio.translate', 'Translate'))}"><span class="msi" style="font-size:14px;">translate</span></button>`
+         : '';
+@@ -1087,7 +1179,7 @@ function renderFriendDetail(d) {
+     const infoContent = `<div class="fd-info-wrap">
+             <div class="fd-info-cols">
+                 <div class="fd-info-left">
+-                    ${_currentWorldCard}${avatarRowHtml}${_bioCard}${_noteCard}
++                    ${_currentWorldCard}${avatarRowHtml}${_fewTagsCard}${_bioCard}${_noteCard}
+                 </div>
+                 <div class="fd-info-right">
+                     ${_ownerCard}${_repCard}${_activityCard}${_modCard}
+diff --git a/main/AppInfo.cs b/main/AppInfo.cs
+index 1f3dd42..ef98057 100644
+--- a/main/AppInfo.cs
++++ b/main/AppInfo.cs
+@@ -1,11 +1,11 @@
+-﻿namespace VRCNext;
++namespace VRCNext;
+ 
+ public static class AppInfo
+ {
+     public const string Version = "2026.62.0";
+     public const string ContactEmail = "vrcn@shinyflvres.com";
+     public const string Website = "vrcn.shinyflvres.com";
+-    public const string UserAgent = $"VRCNext/{Version} ({ContactEmail})";
++    public const string UserAgent = $"FewTags-VRCNext/{Version}";
+ 
+     public static string SelfExecutable
+     {
+diff --git a/main/AuthController.cs b/main/AuthController.cs
+index 20b1209..c3a15a4 100644
+--- a/main/AuthController.cs
++++ b/main/AuthController.cs
+@@ -1433,6 +1433,7 @@ public class AuthController
+                         bio       = selfProfile["bio"]?.ToString() ?? "",
+                         bioLinks  = selfProfile["bioLinks"]?.ToObject<List<string>>()  ?? new List<string>(),
+                         languages = selfProfile["languages"]?.ToObject<List<string>>() ?? new List<string>(),
++                        fewTags   = FewTagsService.GetTags(userId),
+                     });
+                 });
+                 var texId = selfProfile["backgroundTextureId"]?.ToString() ?? "";
+diff --git a/main/FriendsController.cs b/main/FriendsController.cs
+index a465098..3156787 100644
+--- a/main/FriendsController.cs
++++ b/main/FriendsController.cs
+@@ -2161,6 +2161,7 @@ public class FriendsController
+                 ["themeButtonColor"]         = cachedEntry.ProfileThemeButton,
+                 ["themeIconColor"]           = cachedEntry.ProfileThemeIcon,
+                 ["themeSubtextColor"]        = cachedEntry.ProfileThemeSubtext,
++                ["fewTags"]                  = JToken.FromObject(FewTagsService.GetTags(userId) ?? new { labels = Array.Empty<string>(), markedMalicious = false }),
+             };
+             _core.SendToJS("vrcFriendDetail", diskProfile);
+ 
+@@ -2694,6 +2695,7 @@ public class FriendsController
+                 ? appearance["bioLinks"]?.ToObject<List<string>>() ?? new List<string>()
+                 : TryParseJArray(dbCache?.ProfileBioLinks)?.ToObject<List<string>>() ?? new List<string>(),
+             languages = appearance?["languages"]?.ToObject<List<string>>() ?? new List<string>(),
++            fewTags = FewTagsService.GetTags(userId),
+             discordId = user["discordId"]?.ToString() ?? "",
+             isFavorited = _favoriteFriends.ContainsKey(userId),
+             favFriendId = GetFavoriteFriendId(userId),
+diff --git a/main/Program.cs b/main/Program.cs
+index cc96766..0e2c336 100644
+--- a/main/Program.cs
++++ b/main/Program.cs
+@@ -72,6 +72,7 @@ static class Program
+                 SetCurrentProcessExplicitAppUserModelID("com.shinyflvre.vrcnext");
+             CrashHandler.Register();
+             Velopack.VelopackApp.Build().Run();
++            FewTagsService.StartAutoRefresh();
+             new AppShell(args).Run();
+         }
+     }
