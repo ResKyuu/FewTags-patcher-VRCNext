@@ -1,17 +1,58 @@
-# FewTags-enabled VRCNext
+<div align="center">
 
-This repository builds a single-file Windows patcher for VRCNext with FewTags shown in player profiles.
+# VRCNext + FewTags
 
-## Automatic updates
+**FewTags in VRCNext player profiles, installed with one small Windows app.**
 
-GitHub Actions checks the latest public VRCNext release every four hours. For a new release it checks out that exact source tag, applies the small FewTags integration patch, downloads and validates both current FewTags databases, then builds VRCNext and the standalone patcher on a Windows runner. A release is published only when every step succeeds. If VRCNext source changes make the integration patch fail, no replacement release is published.
+[![Build status](https://github.com/ResKyuu/FewTags-patcher-VRCNext/actions/workflows/release-patcher.yml/badge.svg)](https://github.com/ResKyuu/FewTags-patcher-VRCNext/actions/workflows/release-patcher.yml)
+[![Latest release](https://img.shields.io/github/v/release/ResKyuu/FewTags-patcher-VRCNext?label=latest%20patcher)](https://github.com/ResKyuu/FewTags-patcher-VRCNext/releases/latest)
 
-The patcher checks this repository's latest release when it opens. If an updated patcher exists, it asks before downloading it, verifies the published SHA-256 checksum, replaces its own EXE, and restarts. Users do not need Visual Studio, the .NET SDK, or a ZIP beside the patcher.
+<br>
 
-The patcher still fetches the latest FewTags databases each time it patches VRCNext. It detects the default `%LOCALAPPDATA%\VRCNext\current` installation.
+### [Download the latest patcher](https://github.com/ResKyuu/FewTags-patcher-VRCNext/releases/latest)
 
-## Building manually
+One EXE. No Visual Studio, .NET install, or companion ZIP required.
 
-Run the `Build and publish latest VRCNext FewTags patcher` workflow with **workflow_dispatch**. The workflow uses the repository's built-in `GITHUB_TOKEN` with contents write access to create releases; no personal access token or repository secret is required.
+</div>
 
-The VRCNext integration itself is in `integration/fewtags-vrcnext.patch`. The self-updating Windows Forms patcher is in `patcher/`.
+---
+
+## Install or update
+
+1. Download **`VRCNext-FewTags-Patcher.exe`** from the [latest release](https://github.com/ResKyuu/FewTags-patcher-VRCNext/releases/latest).
+2. Run it. It looks for VRCNext in its default install folder: `%LOCALAPPDATA%\VRCNext\current`.
+3. If it is installed elsewhere, select the folder containing `VRCNext.exe`.
+4. Click **Update VRCNext**. Close VRCNext first if the patcher asks you to.
+
+Your existing files that need replacing are backed up in the VRCNext folder. Launch VRCNext as usual when the patch completes.
+
+## What updates automatically
+
+- **FewTags data:** the patcher downloads and validates the newest FewTags databases each time you apply the integration.
+- **Patcher:** when a newer patcher release is available, the app asks before downloading it. It checks the release's SHA-256 checksum before replacing itself.
+- **VRCNext integration:** this repository checks for a VRCNext release every four hours. A compatible build is published automatically after the integration patch and build succeed. The patcher prompts before installing its own update; it will not replace a newer VRCNext install with an older build.
+
+If VRCNext changes in a way that breaks the integration, the build stops and no new patcher release is published until the integration is fixed.
+
+## How the release is built
+
+GitHub Actions checks out the selected VRCNext release, applies [`integration/fewtags-vrcnext.patch`](integration/fewtags-vrcnext.patch), downloads the current FewTags data, and builds both VRCNext and the single-file Windows patcher. The binaries are released only after the build succeeds.
+
+The build job has read-only repository permission. A separate job receives release permission only to publish the completed files.
+
+## Security notes
+
+- Releases are built from public upstream VRCNext source and public FewTags data. Review the source and release notes before installing if you want to inspect what changed.
+- The patcher verifies the downloaded EXE against a SHA-256 file published in the same GitHub release. This detects download corruption; it does not independently prove who created a release.
+- Windows may show a SmartScreen warning because the EXE is not signed with a commercial code-signing certificate.
+- The installer changes files in the selected VRCNext directory and keeps backups of replaced files. It does not request administrator access.
+
+## For contributors
+
+The integration patch is in [`integration/`](integration/), and the Windows Forms patcher is in [`patcher/`](patcher/). To create a release manually, run **Build and publish latest VRCNext FewTags patcher** from the repository's Actions page using **Run workflow**.
+
+## Upstream projects
+
+- [VRCNext](https://github.com/shinyflvre/VRCNext)
+- [FewTags database](https://github.com/Fewdys/FewTags)
+- [FewTags source and animated tag formats](https://github.com/Fewdys/FewTags-VRC-Source)

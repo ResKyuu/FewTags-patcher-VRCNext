@@ -30,6 +30,7 @@ internal sealed class PatcherForm : Form
     private const string PatcherReleaseApi = "https://api.github.com/repos/ResKyuu/FewTags-patcher-VRCNext/releases/latest";
     private const string FewTagsRaw = "https://raw.githubusercontent.com/Fewdys/FewTags/main/";
     private const int MaxDatabaseBytes = 32 * 1024 * 1024;
+    private const long MaxPatcherBytes = 1024L * 1024 * 1024;
     private static readonly HttpClient Http = CreateHttpClient();
 
     private readonly TextBox _target = new() { Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
@@ -210,6 +211,7 @@ internal sealed class PatcherForm : Form
 
     private async Task CheckForPatcherUpdateAsync()
     {
+        string? pendingUpdatePath = null;
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(12));
@@ -239,25 +241,42 @@ internal sealed class PatcherForm : Form
             _status.Text = "Downloading the latest patcher…";
             var exeUrl = exeAsset.GetProperty("browser_download_url").GetString()!;
             var hashUrl = hashAsset.GetProperty("browser_download_url").GetString()!;
+            if (!IsGitHubReleaseUrl(exeUrl) || !IsGitHubReleaseUrl(hashUrl))
+                throw new InvalidDataException("The release contains an unexpected patcher download URL.");
             var hashText = await Http.GetStringAsync(hashUrl, timeout.Token);
-            var expectedHash = hashText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            var hashParts = hashText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (hashParts.Length != 2 || hashParts[0].Length != 64 ||
+                hashParts[0].Any(character => !Uri.IsHexDigit(character)) ||
+                !string.Equals(hashParts[1], "VRCNext-FewTags-Patcher.exe", StringComparison.Ordinal))
+                throw new InvalidDataException("The patcher release contains an invalid SHA-256 checksum file.");
+            var expectedHash = Convert.FromHexString(hashParts[0]);
             var currentExe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName
                 ?? throw new InvalidOperationException("Could not locate the current patcher executable.");
             var downloadPath = Path.Combine(Path.GetTempPath(), $"VRCNext-FewTags-Patcher-{Guid.NewGuid():N}.exe");
+            pendingUpdatePath = downloadPath;
             using (var download = await Http.GetAsync(exeUrl, HttpCompletionOption.ResponseHeadersRead, timeout.Token))
             {
                 download.EnsureSuccessStatusCode();
-                if (download.Content.Headers.ContentLength is > 1024L * 1024 * 1024)
+                if (download.Content.Headers.ContentLength is > MaxPatcherBytes)
                     throw new InvalidDataException("The patcher update exceeded the 1 GiB download limit.");
                 await using var source = await download.Content.ReadAsStreamAsync(timeout.Token);
                 await using var destination = new FileStream(downloadPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true);
-                await source.CopyToAsync(destination, timeout.Token);
+                var buffer = new byte[1024 * 1024];
+                long totalBytes = 0;
+                while (true)
+                {
+                    var read = await source.ReadAsync(buffer, timeout.Token);
+                    if (read == 0) break;
+                    totalBytes += read;
+                    if (totalBytes > MaxPatcherBytes)
+                        throw new InvalidDataException("The patcher update exceeded the 1 GiB download limit.");
+                    await destination.WriteAsync(buffer.AsMemory(0, read), timeout.Token);
+                }
             }
             await using (var downloaded = File.OpenRead(downloadPath))
             {
                 var actualHash = SHA256.HashData(downloaded);
-                if (expectedHash is null || !CryptographicOperations.FixedTimeEquals(
-                        Convert.FromHexString(expectedHash), actualHash))
+                if (!CryptographicOperations.FixedTimeEquals(expectedHash, actualHash))
                     throw new InvalidDataException("The downloaded patcher did not match the SHA-256 checksum published with the release.");
             }
 
@@ -273,17 +292,34 @@ internal sealed class PatcherForm : Form
             updater.ArgumentList.Add(Environment.ProcessId.ToString());
             var updateProcess = Process.Start(updater);
             if (updateProcess is null) throw new InvalidOperationException("Could not start the patcher update.");
+            pendingUpdatePath = null;
             _status.Text = "Restarting with the updated patcher…";
             Application.Exit();
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            if (pendingUpdatePath is not null)
+            {
+                try { File.Delete(pendingUpdatePath); } catch { }
+            }
+        }
         catch (Exception ex)
         {
+            if (pendingUpdatePath is not null)
+            {
+                try { File.Delete(pendingUpdatePath); } catch { }
+            }
             _patch.Enabled = true;
             _status.Text = "Patcher update check failed; the installed patcher is still available.";
             if (ex is not HttpRequestException) MessageBox.Show(this, ex.Message, "Patcher update failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
+
+    private static bool IsGitHubReleaseUrl(string value) =>
+        Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+        uri.Scheme == Uri.UriSchemeHttps &&
+        string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase) &&
+        uri.AbsolutePath.Contains("/releases/download/", StringComparison.Ordinal);
 
     private static async Task EnsurePayloadSupportsLatestAsync(string target)
     {

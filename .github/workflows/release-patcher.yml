@@ -11,9 +11,6 @@ on:
     - cron: "17 */4 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 concurrency:
   group: latest-vrcnext-patcher
   cancel-in-progress: false
@@ -21,14 +18,26 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      upstream_tag: ${{ steps.check.outputs.tag }}
+      release_tag: ${{ steps.apply-integration.outputs.release_tag }}
+      version: ${{ steps.apply-integration.outputs.version }}
     steps:
       - name: Check whether VRCNext has a newer release
         id: check
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const upstream = await github.rest.repos.getLatestRelease({ owner: 'shinyflvre', repo: 'VRCNext' });
-            core.setOutput('tag', upstream.data.tag_name);
+            const tag = upstream.data.tag_name;
+            if (!/^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag)) {
+              throw new Error(`Unexpected VRCNext release tag format: ${tag}`);
+            }
+            core.setOutput('tag', tag);
             let previous = null;
             try {
               const release = await github.rest.repos.getLatestRelease({ owner: context.repo.owner, repo: context.repo.repo });
@@ -37,28 +46,32 @@ jobs:
             } catch (error) {
               if (error.status !== 404) throw error;
             }
-            core.setOutput('build', previous === upstream.data.tag_name ? 'false' : 'true');
-            core.info(`Upstream ${upstream.data.tag_name}; last integrated ${previous || '(none)'}`);
+            core.setOutput('build', previous === tag ? 'false' : 'true');
+            core.info(`Upstream ${tag}; last integrated ${previous || '(none)'}`);
 
       - name: Check out patcher source
         if: steps.check.outputs.build == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: patcher-repo
+          persist-credentials: false
 
       - name: Check out latest VRCNext source and submodules
         if: steps.check.outputs.build == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: shinyflvre/VRCNext
           ref: ${{ steps.check.outputs.tag }}
           submodules: recursive
           path: vrcnext
+          persist-credentials: false
 
       - name: Apply FewTags integration
         id: apply-integration
         if: steps.check.outputs.build == 'true'
         shell: pwsh
+        env:
+          UPSTREAM_TAG: ${{ steps.check.outputs.tag }}
         run: |
           $patch = Join-Path $env:GITHUB_WORKSPACE 'patcher-repo/integration/fewtags-vrcnext.patch'
           git -C vrcnext apply --check $patch
@@ -74,13 +87,16 @@ jobs:
               throw "GitHub returned an invalid $name database."
             }
           }
-          $version = '${{ steps.check.outputs.tag }}'.TrimStart('v', 'V')
+          if ($env:UPSTREAM_TAG -notmatch '^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
+            throw 'The VRCNext release tag did not pass version validation.'
+          }
+          $version = $Matches[1]
           "version=$version" >> $env:GITHUB_OUTPUT
           "release_tag=v$version-fewtags.$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_OUTPUT
 
       - name: Install .NET 9 SDK
         if: steps.check.outputs.build == 'true'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 9.0.x
 
@@ -98,12 +114,15 @@ jobs:
       - name: Publish single-file patcher
         if: steps.check.outputs.build == 'true'
         shell: pwsh
+        env:
+          VRCNEXT_VERSION: ${{ steps.apply-integration.outputs.version }}
+          PATCHER_RELEASE_TAG: ${{ steps.apply-integration.outputs.release_tag }}
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'patcher'
           dotnet publish 'patcher-repo/patcher/VRCNextFewTagsPatcher.csproj' -c Release -r win-x64 --self-contained true `
             -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false `
-            "-p:VRCNextVersion=${{ steps.apply-integration.outputs.version }}" `
-            "-p:PatcherVersion=${{ steps.apply-integration.outputs.release_tag }}" `
+            "-p:VRCNextVersion=$env:VRCNEXT_VERSION" `
+            "-p:PatcherVersion=$env:PATCHER_RELEASE_TAG" `
             "-p:VRCNextPayloadArchive=$env:VRCNEXT_PAYLOAD" -o $out
           $exe = Join-Path $out 'VRCNext-FewTags-Patcher.exe'
           if (-not (Test-Path $exe)) { throw 'Patcher publish did not produce the single-file EXE.' }
@@ -114,17 +133,42 @@ jobs:
           "$hash  VRCNext-FewTags-Patcher.exe" | Set-Content -LiteralPath (Join-Path $release 'VRCNext-FewTags-Patcher.exe.sha256') -NoNewline
           "RELEASE_DIR=$release" >> $env:GITHUB_ENV
 
-      - name: Publish release
+      - name: Upload release files for the publish job
         if: steps.check.outputs.build == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          tag_name: ${{ steps.apply-integration.outputs.release_tag }}
-          name: VRCNext ${{ steps.apply-integration.outputs.version }} with FewTags
-          body: |
-            VRCNext release: ${{ steps.check.outputs.tag }}
+          name: patcher-release-files
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 1
 
-            This release contains the latest compatible VRCNext build with the FewTags profile integration. The patcher downloads the latest FewTags databases when it runs.
-          files: |
-            ${{ runner.temp }}/release/VRCNext-FewTags-Patcher.exe
-            ${{ runner.temp }}/release/VRCNext-FewTags-Patcher.exe.sha256
-          make_latest: true
+  release:
+    needs: build
+    if: needs.build.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download completed release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: patcher-release-files
+          path: release
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+          RELEASE_TITLE: VRCNext ${{ needs.build.outputs.version }} with FewTags
+          UPSTREAM_TAG: ${{ needs.build.outputs.upstream_tag }}
+        run: |
+          notes_file="${RUNNER_TEMP}/release-notes.md"
+          printf 'VRCNext release: %s\n\nThis release contains the latest compatible VRCNext build with the FewTags profile integration. The patcher downloads the latest FewTags databases when it runs.\n' "$UPSTREAM_TAG" > "$notes_file"
+          gh release create "$RELEASE_TAG" \
+            release/VRCNext-FewTags-Patcher.exe \
+            release/VRCNext-FewTags-Patcher.exe.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$notes_file" \
+            --latest
